@@ -1,0 +1,230 @@
+# ============================================================
+# build-image.yml
+#
+# Builds a bootable GPT disk image from the contents of the
+# input/ directory and publishes it as a GitHub Release.
+#
+# Trigger: manual only (Actions → Run workflow)
+# ============================================================
+
+name: Build & Release Disk Image
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      image_name:
+        description: "Image file name (without .img extension)"
+        required: true
+        default: "boot"
+
+      tag_name:
+        description: "Git tag for the release  (e.g. v1.0.0)"
+        required: true
+
+      release_title:
+        description: "Release title shown on GitHub"
+        required: true
+
+      release_notes:
+        description: "Release description / changelog (markdown)"
+        required: false
+        default: ""
+
+      img_size_mib:
+        description: "Total disk image size in MiB  (ESP = size − 4 MiB overhead)"
+        required: false
+        default: "64"
+
+      prerelease:
+        description: "Mark as pre-release?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+# ============================================================
+jobs:
+  build-and-release:
+    name: "Build image → create release"
+    runs-on: ubuntu-latest
+
+    # Needed to push tags and create releases via gh CLI
+    permissions:
+      contents: write
+
+    steps:
+      # ----------------------------------------------------------
+      # 1. Checkout — we need the input/ folder
+      # ----------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------
+      # 2. Validate inputs early to fail fast before doing work
+      # ----------------------------------------------------------
+      - name: Validate inputs
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          NAME="${{ inputs.image_name }}"
+          SIZE="${{ inputs.img_size_mib }}"
+
+          # Tag must look like v1.2.3 or any non-empty string without spaces
+          if [[ -z "${TAG}" ]]; then
+            echo "::error::tag_name is empty"
+            exit 1
+          fi
+          if [[ "${TAG}" == *" "* ]]; then
+            echo "::error::tag_name must not contain spaces: '${TAG}'"
+            exit 1
+          fi
+
+          # Image name must be a valid filename
+          if [[ -z "${NAME}" || "${NAME}" == *"/"* || "${NAME}" == *".."* ]]; then
+            echo "::error::image_name is invalid: '${NAME}'"
+            exit 1
+          fi
+
+          # Size must be a positive integer >= 8
+          if ! [[ "${SIZE}" =~ ^[0-9]+$ ]] || (( SIZE < 8 )); then
+            echo "::error::img_size_mib must be an integer >= 8, got '${SIZE}'"
+            exit 1
+          fi
+
+          # input/ must exist and have at least one real file
+          if [ ! -d "input" ]; then
+            echo "::error::input/ directory does not exist in the repository"
+            exit 1
+          fi
+          FILE_COUNT=$(find input -type f ! -name ".gitkeep" | wc -l)
+          if (( FILE_COUNT == 0 )); then
+            echo "::error::input/ directory is empty — nothing to package"
+            exit 1
+          fi
+
+          echo "Inputs OK:"
+          echo "  tag_name    = ${TAG}"
+          echo "  image_name  = ${NAME}.img"
+          echo "  img_size    = ${SIZE} MiB"
+          echo "  file_count  = ${FILE_COUNT} file(s) in input/"
+
+      # ----------------------------------------------------------
+      # 3. System packages required for image creation
+      # ----------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            parted \
+            dosfstools
+
+      # ----------------------------------------------------------
+      # 4. Show what will go into the image
+      # ----------------------------------------------------------
+      - name: List input/ contents
+        run: |
+          echo "=== Files to be placed in the ESP root ==="
+          find input -not -name ".gitkeep" | sort | sed 's|^input/||'
+
+      # ----------------------------------------------------------
+      # 5. Build the bootable GPT disk image
+      #
+      #    Disk layout:
+      #      0     – 2 MiB  : GPT header + alignment gap
+      #      2 MiB – END-2   : EFI System Partition (FAT32)
+      #      END-2 – END     : GPT backup header
+      #
+      #    Everything inside input/ is copied to the ESP root,
+      #    preserving the directory structure:
+      #
+      #      input/EFI/Boot/bootx64.efi
+      #        → <esp>/EFI/Boot/bootx64.efi
+      # ----------------------------------------------------------
+      - name: Create bootable GPT disk image
+        run: |
+          IMG="${{ inputs.image_name }}.img"
+          SIZE="${{ inputs.img_size_mib }}"
+          ESP_END=$(( SIZE - 2 ))
+
+          echo ">>> Creating ${SIZE} MiB disk image: ${IMG}"
+          dd if=/dev/zero of="${IMG}" bs=1M count="${SIZE}" status=progress
+
+          echo ">>> Partitioning: GPT + single EFI System Partition (2 MiB – ${ESP_END} MiB)..."
+          parted -s "${IMG}" mklabel gpt
+          parted -s "${IMG}" mkpart "EFI" fat32 2MiB "${ESP_END}MiB"
+          parted -s "${IMG}" set 1 esp on
+          parted -s "${IMG}" print
+
+          echo ">>> Attaching loop device..."
+          LOOP=$(sudo losetup --find --show --partscan "${IMG}")
+          echo "Attached as ${LOOP}"
+
+          echo ">>> Formatting ESP as FAT32..."
+          # Volume label max 11 chars; uppercase; derive from image name
+          LABEL=$(echo "${{ inputs.image_name }}" | tr '[:lower:]' '[:upper:]' | cut -c1-11)
+          sudo mkfs.fat -F 32 -n "${LABEL}" "${LOOP}p1"
+
+          echo ">>> Copying contents of input/ into ESP..."
+          sudo mkdir -p /mnt/esp
+          sudo mount "${LOOP}p1" /mnt/esp
+
+          # Copy everything except .gitkeep, preserve directory tree
+          find input -type d ! -name "input" | while read -r dir; do
+            sudo mkdir -p "/mnt/esp/${dir#input/}"
+          done
+          find input -type f ! -name ".gitkeep" | while read -r file; do
+            sudo cp "${file}" "/mnt/esp/${file#input/}"
+          done
+
+          echo ">>> ESP contents after copy:"
+          find /mnt/esp -type f | sort | sed "s|/mnt/esp/||"
+
+          sudo sync
+          sudo umount /mnt/esp
+          sudo losetup --detach "${LOOP}"
+
+          echo "=== Image ready ==="
+          ls -lh "${IMG}"
+          file "${IMG}"
+
+      # ----------------------------------------------------------
+      # 6. Create git tag + GitHub Release + attach the .img
+      #
+      #    gh release create handles all three in one call:
+      #      - creates the tag at HEAD
+      #      - creates the release
+      #      - uploads the .img as a release asset
+      #
+      #    No artifact upload/download round-trip needed.
+      # ----------------------------------------------------------
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMG="${{ inputs.image_name }}.img"
+          TAG="${{ inputs.tag_name }}"
+          TITLE="${{ inputs.release_title }}"
+          NOTES="${{ inputs.release_notes }}"
+          IS_PRE="${{ inputs.prerelease }}"
+
+          # Build gh flags
+          FLAGS="--title \"${TITLE}\""
+          if [[ -n "${NOTES}" ]]; then
+            FLAGS="${FLAGS} --notes \"${NOTES}\""
+          else
+            FLAGS="${FLAGS} --notes \"\""
+          fi
+          if [[ "${IS_PRE}" == "true" ]]; then
+            FLAGS="${FLAGS} --prerelease"
+          fi
+
+          echo ">>> Creating release '${TITLE}' with tag '${TAG}'..."
+
+          gh release create "${TAG}" \
+            --title "${TITLE}" \
+            --notes "${NOTES}" \
+            $( [[ "${IS_PRE}" == "true" ]] && echo "--prerelease" ) \
+            "${IMG}"
+
+          echo ">>> Done!"
+          echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
